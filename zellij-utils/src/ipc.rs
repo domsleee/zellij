@@ -572,5 +572,12 @@ pub fn bind_server(name: &Path) -> Result<LocalSocketListener> {
 pub fn bind_server(name: &Path) -> Result<Pipe> {
     let pipe = Pipe::new(name);
 
+    // Create a marker file in ZELLIJ_SOCK_DIR so session discovery can find this
+    // session via fs::read_dir. On Unix, the socket file itself serves this purpose.
+    if let Some(parent) = name.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::File::create(name);
+
     Ok(pipe)
 }

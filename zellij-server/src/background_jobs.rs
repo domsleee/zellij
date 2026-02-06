@@ -599,26 +599,25 @@ fn write_session_state_to_disk(
 
 fn read_other_live_session_states(current_session_name: &str) -> BTreeMap<String, SessionInfo> {
     let mut other_session_names: Vec<String> = vec![];
-    let session_infos_on_machine = BTreeMap::new();
+    let mut session_infos_on_machine = BTreeMap::new();
     // we do this so that the session infos will be actual and we're
     // reasonably sure their session is running
     if let Ok(files) = fs::read_dir(&*ZELLIJ_SOCK_DIR) {
         files.for_each(|file| {
             if let Ok(file) = file {
                 if let Ok(file_name) = file.file_name().into_string() {
-                    if is_socket(&file).expect("Could not check for pipe") {
+                    if is_socket(&file).unwrap_or(false) {
                         other_session_names.push(file_name);
                     }
                 }
             }
         });
     }
-    #[cfg(unix)]
     for session_name in other_session_names {
         let session_cache_file_name = session_info_cache_file_name(&session_name);
         if let Ok(raw_session_info) = fs::read_to_string(&session_cache_file_name) {
             if let Ok(session_info) =
-                SessionInfo::from_string(&raw_session_info, &current_session_name)
+                SessionInfo::from_string(&raw_session_info, current_session_name)
             {
                 session_infos_on_machine.insert(session_name, session_info);
             }

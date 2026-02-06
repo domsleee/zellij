@@ -40,7 +40,7 @@ pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
                     sessions.push((file_name, duration));
                 }
                 #[cfg(windows)]
-                if is_socket(&file).unwrap() {
+                if is_socket(&file).unwrap_or(false) {
                     sessions.push((file_name, duration));
                 }
             });
@@ -51,28 +51,10 @@ pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
 }
 
 fn iter_sessions() -> Result<Box<dyn Iterator<Item = DirEntry>>, io::Error> {
-    #[cfg(windows)]
-    {
-        use std::path::PathBuf;
-
-        let path = PathBuf::from("\\\\.\\pipe\\");
-        match fs::read_dir(path) {
-            Ok(pipes) => {
-                Ok(Box::new(pipes.map(|file| file.unwrap()).filter(|file| {
-                    file.path().starts_with("\\\\.\\pipe\\zellij")
-                })))
-            },
-            Err(err) if io::ErrorKind::NotFound != err.kind() => Err(err),
-            Err(_) => Ok(Box::new(empty())),
-        }
-    }
-    #[cfg(unix)]
-    {
-        match fs::read_dir(&*ZELLIJ_SOCK_DIR) {
-            Ok(files) => Ok(files.map(|file| file.unwrap())),
-            Err(err) if io::ErrorKind::NotFound != err.kind() => Err(err),
-            Err(_) => Ok(empty()),
-        }
+    match fs::read_dir(&*ZELLIJ_SOCK_DIR) {
+        Ok(files) => Ok(Box::new(files.map(|file| file.unwrap()))),
+        Err(err) if io::ErrorKind::NotFound != err.kind() => Err(err),
+        Err(_) => Ok(Box::new(empty())),
     }
 }
 

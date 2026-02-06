@@ -1,5 +1,11 @@
 parallel-compiler = true
 
+# Override winpty-rs build script to only enable ConPTY (built into Windows 10+).
+# This prevents dynamic linking against winpty.dll, which would otherwise be
+# required at runtime if winpty-agent is found on PATH during compilation.
+[target.x86_64-pc-windows-msvc.winpty]
+rustc-cfg = ['feature="conpty"']
+
 [alias]
 xtask = "run --package xtask --"
 x = "xtask"
