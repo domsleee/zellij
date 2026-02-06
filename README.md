@@ -11,18 +11,21 @@ This is an experimental fork of [Zellij](https://github.com/zellij-org/zellij) a
 - **Web server** - browser-based terminal UI via Axum+Tokio (`zellij web --start`), gated behind `web_server_capability` feature
 - **CLI** - `--help`, `--version`, subcommands all work
 - **Signal handling** - Ctrl+C, Ctrl+Break, console close via `SetConsoleCtrlHandler`
+- **Mouse support** - works via ConPTY
 - **Terminal resize** - detected via `WINDOW_BUFFER_SIZE_EVENT`
 - **Session discovery** - marker files in `ZELLIJ_SOCK_DIR` + `WaitNamedPipeW` validation
 - **Server runs hidden** - server window hidden via PowerShell `-WindowStyle Hidden`
 - **ZELLIJ_PANE_ID** - environment variable passed to spawned panes
 
+### Partially Working
+
+- **Session persistence** - sessions don't survive client detach because Unix `daemonize` (fork) isn't available on Windows; server process is tied to the client lifetime
+- **Session manager plugin** (Ctrl+O, W) - initial pane exits immediately, plugins don't load
+
 ### Not Yet Working
 
-- **Session manager plugin** (Ctrl+O, W) - initial pane exits immediately, plugins don't load
-- **Mouse support** - events are read but discarded
 - **`tcdrain`** - stubbed as no-op (ConPTY handles flushing internally)
 - **E2E tests** - test runner is Linux-only (SSH remote runner)
-- **Daemonize** - not supported on Windows, runs in foreground with a warning
 
 ### Test Results (Windows)
 
