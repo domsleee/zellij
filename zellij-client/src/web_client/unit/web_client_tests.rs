@@ -1,18 +1,24 @@
 use super::serve_web_client;
 use super::*;
+#[cfg(unix)]
 use futures_util::{SinkExt, StreamExt};
+#[cfg(unix)]
 use isahc::prelude::*;
 use serde_json;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use tokio::time::timeout;
+#[cfg(unix)]
 use tokio_tungstenite::tungstenite::http::Request;
+#[cfg(unix)]
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use zellij_utils::input::cli_assets::CliAssets;
 use zellij_utils::input::layout::Layout;
 use zellij_utils::{consts::VERSION, input::config::Config, input::options::Options};
 
 use crate::os_input_output::ClientOsApi;
+#[cfg(unix)]
 use crate::web_client::control_message::{
     WebClientToWebServerControlMessage, WebClientToWebServerControlMessagePayload,
     WebServerToWebClientControlMessage,
@@ -26,8 +32,13 @@ use zellij_utils::{
     web_authentication_tokens::{create_token, delete_db, revoke_token},
 };
 
+#[cfg(unix)]
 use serial_test::serial;
 
+// The tests in this inner module use isahc (curl-sys) and tokio::test which hang on
+// Windows due to pipe.accept() blocking the tokio runtime shutdown. Windows-specific
+// tests using raw TCP and manual runtime are defined below.
+#[cfg(unix)]
 mod web_client_tests {
     use super::*;
 
@@ -1297,7 +1308,7 @@ impl SessionManager for MockSessionManager {
         _os_input: Box<dyn ClientOsApi>,
         _requested_layout: Option<LayoutInfo>,
     ) -> (ClientToServerMsg, PathBuf) {
-        let mock_ipc_path = PathBuf::from(format!("/tmp/mock_zellij_{}", session_name));
+        let mock_ipc_path = std::env::temp_dir().join(format!("mock_zellij_{}", session_name));
 
         let cli_assets = CliAssets {
             config_file_path,
@@ -1361,17 +1372,26 @@ impl MockClientOsApi {
         }
     }
 
+    #[allow(dead_code)]
     fn get_sent_messages(&self) -> Vec<ClientToServerMsg> {
         self.messages_to_server.lock().unwrap().clone()
     }
 }
 
 impl ClientOsApi for MockClientOsApi {
-    fn get_terminal_size_using_fd(&self, _fd: std::os::unix::io::RawFd) -> Size {
+    fn get_terminal_size(&self, _handle_type: crate::os_input_output::HandleType) -> Size {
         self.terminal_size
     }
+    #[cfg(unix)]
     fn set_raw_mode(&mut self, _fd: std::os::unix::io::RawFd) {}
+    #[cfg(windows)]
+    fn set_raw_mode(&mut self, _handle_type: u32, _enable_mode: u32, _disable_mode: u32) {}
+    #[cfg(unix)]
     fn unset_raw_mode(&self, _fd: std::os::unix::io::RawFd) -> Result<(), nix::Error> {
+        Ok(())
+    }
+    #[cfg(windows)]
+    fn unset_raw_mode(&self, _handle: u32) -> anyhow::Result<()> {
         Ok(())
     }
     fn get_stdout_writer(&self) -> Box<dyn std::io::Write> {
@@ -1407,4 +1427,253 @@ impl ClientOsApi for MockClientOsApi {
     fn stdin_poller(&self) -> crate::os_input_output::StdinPoller {
         crate::os_input_output::StdinPoller::default()
     }
+}
+
+/// Helper to run web server tests with a manual runtime that can be force-shutdown.
+/// This is needed because `listen_to_web_server_instructions` blocks in `spawn_blocking`
+/// with `pipe.accept()` (Windows named pipes), and tokio's default runtime drop waits
+/// for all blocking threads to finish. Using `shutdown_timeout` forces cleanup.
+#[cfg(windows)]
+fn run_web_server_test<F: std::future::Future<Output = ()> + Send + 'static>(test_fn: F) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+    rt.block_on(test_fn);
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+}
+
+/// Helper to start the web server and wait for it to be ready.
+/// Returns the port and server JoinHandle.
+#[cfg(windows)]
+async fn start_test_web_server() -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    std::path::PathBuf,
+) {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let session_manager = Arc::new(MockSessionManager::new());
+    let client_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+
+    let config = Config::default();
+    let options = Options::default();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let temp_config_path = std::env::temp_dir().join(format!(
+        "test_config_win_{}.kdl",
+        std::process::id()
+    ));
+    let _ = std::fs::write(&temp_config_path, "");
+
+    let config_path = temp_config_path.clone();
+    let server_handle = tokio::spawn(async move {
+        serve_web_client(
+            config,
+            options,
+            Some(config_path),
+            listener,
+            None,
+            Some(session_manager),
+            Some(client_os_api_factory),
+        )
+        .await;
+    });
+
+    // Wait for server to be ready
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(Ok(mut stream)) =
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                TcpStream::connect(format!("127.0.0.1:{}", port)),
+            )
+            .await
+        {
+            let request = format!(
+                "GET /info/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                port
+            );
+            if stream.write_all(request.as_bytes()).await.is_ok() {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(Ok(n)) = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    stream.read(&mut buf),
+                )
+                .await
+                {
+                    let resp = String::from_utf8_lossy(&buf[..n]);
+                    if resp.contains("200") {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    (port, server_handle, temp_config_path)
+}
+
+/// Verify the axum web server starts and responds to HTTP on Windows.
+/// Uses raw TCP instead of isahc to avoid curl-sys/MSYS2 issues.
+#[cfg(windows)]
+#[test]
+fn test_windows_web_server_version_endpoint() {
+    run_web_server_test(async {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (port, server_handle, config_path) = start_test_web_server().await;
+
+        // Make the actual test request
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .expect("Failed to connect to server");
+        let request = format!(
+            "GET /info/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            port
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("Failed to write request");
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("Read timed out")
+            .expect("Read failed");
+
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("200 OK"),
+            "Expected 200 OK, got: {}",
+            response
+        );
+        assert!(
+            response.contains(VERSION),
+            "Expected version {}, got: {}",
+            VERSION,
+            response
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    });
+}
+
+/// Verify the login endpoint accepts valid auth tokens on Windows.
+#[cfg(windows)]
+#[test]
+fn test_windows_web_server_login() {
+    run_web_server_test(async {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let _ = delete_db();
+
+        let test_token_name = "test_token_win_login";
+        let (auth_token, _) =
+            create_token(Some(test_token_name.to_string())).expect("Failed to create test token");
+
+        let (port, server_handle, config_path) = start_test_web_server().await;
+
+        // Send login request
+        let body = serde_json::json!({
+            "auth_token": auth_token,
+            "remember_me": true
+        })
+        .to_string();
+        let request = format!(
+            "POST /command/login HTTP/1.1\r\n\
+             Host: 127.0.0.1:{}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            port,
+            body.len(),
+            body
+        );
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .expect("Failed to connect");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("Failed to write");
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("Read timed out")
+            .expect("Read failed");
+
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("200 OK"),
+            "Expected 200 OK, got: {}",
+            response
+        );
+        assert!(
+            response.contains("session_token="),
+            "Expected session_token cookie, got: {}",
+            response
+        );
+
+        let _ = revoke_token(test_token_name);
+        server_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    });
+}
+
+/// Verify that accessing protected endpoints without auth returns 401.
+#[cfg(windows)]
+#[test]
+fn test_windows_web_server_unauthorized() {
+    run_web_server_test(async {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (port, server_handle, config_path) = start_test_web_server().await;
+
+        // Try to create a session without auth
+        let request = format!(
+            "POST /session HTTP/1.1\r\n\
+             Host: 127.0.0.1:{}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n",
+            port
+        );
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .expect("Failed to connect");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("Failed to write");
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("Read timed out")
+            .expect("Read failed");
+
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("401"),
+            "Expected 401 Unauthorized, got: {}",
+            response
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    });
 }

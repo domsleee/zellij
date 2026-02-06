@@ -5442,10 +5442,10 @@ pub fn pane_info_for_pane(
     pane_info
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "./unit/tab_tests.rs"]
 mod tab_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "./unit/tab_integration_tests.rs"]
 mod tab_integration_tests;

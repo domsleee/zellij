@@ -1,14 +1,14 @@
 pub const BUFSIZE: DWORD = 512;
 
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     io,
     mem::MaybeUninit,
     os::windows::{
         ffi::OsStrExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
-    path::{Path, PathBuf},
+    path::Path,
     ptr,
     sync::Arc,
 };
@@ -17,7 +17,7 @@ use winapi::{
     shared::{
         minwindef::{DWORD, TRUE},
         winerror::{
-            ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY,
+            ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY,
             ERROR_PIPE_CONNECTED,
         },
     },
@@ -396,7 +396,17 @@ impl std::io::Write for PipeStream {
                 .map(|_| consumed as usize)
             },
             Err(err) => {
-                log::error!("Error writing to pipe: {}", err);
+                // ERROR_NO_DATA (232) = pipe is being closed
+                // ERROR_BROKEN_PIPE (109) = pipe has been ended
+                // Both are expected during shutdown when the other end disconnects.
+                match err.raw_os_error() {
+                    Some(232) | Some(109) => {
+                        log::debug!("Pipe closed during write: {}", err);
+                    },
+                    _ => {
+                        log::error!("Error writing to pipe: {}", err);
+                    },
+                }
                 Err(err)
             },
         }
@@ -421,3 +431,210 @@ impl std::io::Write for PipeStream {
 // SAFETY: Microsoft sample does send a HANDLE from one thread to another.
 // You even can send a handle from one process to another using DuplicateHandle
 unsafe impl Send for PipeStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Unique counter to avoid pipe name collisions between tests running in parallel
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_pipe_path() -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        PathBuf::from(format!("test_pipe_{}_{}_{}", pid, id, std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+    }
+
+    #[test]
+    fn pipe_name_conversion() {
+        let path = PathBuf::from("my_session");
+        let pipe = Pipe::new(&path);
+        // Verify the pipe name starts with \\.\pipe\zellij\ prefix
+        let name_str: String = pipe.pipe_name.iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| char::from_u32(c as u32).unwrap_or('?'))
+            .collect();
+        assert!(name_str.starts_with(r"\\.\pipe\zellij\"), "Pipe name should start with \\\\.\\pipe\\zellij\\, got: {}", name_str);
+        assert!(name_str.ends_with("my_session"), "Pipe name should end with session name, got: {}", name_str);
+    }
+
+    #[test]
+    fn pipe_round_trip_small_message() {
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let mut server_stream = pipe_clone.accept().expect("Server accept failed");
+            let mut buf = [0u8; 256];
+            let n = server_stream.read(&mut buf).expect("Server read failed");
+            assert_eq!(&buf[..n], b"hello from client");
+            server_stream.write_all(b"hello from server").expect("Server write failed");
+            server_stream.flush().expect("Server flush failed");
+        });
+
+        // Give the server a moment to create the pipe
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut client_stream = pipe.connect().expect("Client connect failed");
+        client_stream.write_all(b"hello from client").expect("Client write failed");
+        client_stream.flush().expect("Client flush failed");
+
+        // Wait for server to process and respond
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut buf = [0u8; 256];
+        let n = client_stream.read(&mut buf).expect("Client read failed");
+        assert_eq!(&buf[..n], b"hello from server");
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn pipe_round_trip_two_messages() {
+        // Tests that a pipe can handle more than one message exchange.
+        // Uses separate send/recv phases to avoid FlushFileBuffers deadlocks.
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let mut server_stream = pipe_clone.accept().expect("Server accept failed");
+
+            // Read first message
+            let mut buf = [0u8; 256];
+            let n = server_stream.read(&mut buf).expect("Server read 1 failed");
+            assert_eq!(&buf[..n], b"msg_1");
+
+            // Send first reply
+            server_stream.write_all(b"reply_1").expect("Server write 1 failed");
+
+            // Read second message
+            let mut buf = [0u8; 256];
+            let n = server_stream.read(&mut buf).expect("Server read 2 failed");
+            assert_eq!(&buf[..n], b"msg_2");
+
+            // Send second reply
+            server_stream.write_all(b"reply_2").expect("Server write 2 failed");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut client_stream = pipe.connect().expect("Client connect failed");
+
+        // Send first message
+        client_stream.write_all(b"msg_1").expect("Client write 1 failed");
+
+        // Read first reply (this will block until server has written)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut buf = [0u8; 256];
+        let n = client_stream.read(&mut buf).expect("Client read 1 failed");
+        assert_eq!(&buf[..n], b"reply_1");
+
+        // Send second message
+        client_stream.write_all(b"msg_2").expect("Client write 2 failed");
+
+        // Read second reply
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut buf = [0u8; 256];
+        let n = client_stream.read(&mut buf).expect("Client read 2 failed");
+        assert_eq!(&buf[..n], b"reply_2");
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn pipe_try_clone() {
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let mut server_stream = pipe_clone.accept().expect("Server accept failed");
+            let mut buf = [0u8; 256];
+            let n = server_stream.read(&mut buf).expect("Server read failed");
+            assert_eq!(&buf[..n], b"from cloned handle");
+            server_stream.write_all(b"ack").expect("Server write failed");
+            server_stream.flush().expect("Server flush failed");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let client_stream = pipe.connect().expect("Client connect failed");
+        let mut cloned = client_stream.try_clone().expect("try_clone failed");
+
+        // Write using the cloned handle
+        cloned.write_all(b"from cloned handle").expect("Cloned write failed");
+        cloned.flush().expect("Cloned flush failed");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut buf = [0u8; 256];
+        let n = cloned.read(&mut buf).expect("Cloned read failed");
+        assert_eq!(&buf[..n], b"ack");
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn pipe_accept_iterator() {
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        // Test that the incoming() iterator yields connections
+        let server_thread = std::thread::spawn(move || {
+            let mut incoming = pipe_clone.incoming();
+            // Accept one connection
+            let mut stream = incoming.next().unwrap().expect("Accept from iterator failed");
+            let mut buf = [0u8; 256];
+            let n = stream.read(&mut buf).expect("Read from iterator stream failed");
+            assert_eq!(&buf[..n], b"iterator test");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut client = pipe.connect().expect("Client connect failed");
+        client.write_all(b"iterator test").expect("Client write failed");
+        client.flush().expect("Client flush failed");
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn pipe_left_bytes() {
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let mut server_stream = pipe_clone.accept().expect("Server accept failed");
+            // Write data without flushing - FlushFileBuffers blocks until client reads,
+            // which would deadlock since we only want to peek.
+            server_stream.write_all(b"peek test data").expect("Server write failed");
+            // Keep the connection alive while client peeks
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut client_stream = pipe.connect().expect("Client connect failed");
+        // Wait for data to arrive in the pipe buffer
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Check that left_bytes reports data available
+        let (_left, available) = client_stream.left_bytes().expect("left_bytes failed");
+        assert!(available > 0, "Expected data to be available, got available={}", available);
+
+        // Now actually read to unblock the server
+        let mut buf = [0u8; 256];
+        let n = client_stream.read(&mut buf).expect("Client read failed");
+        assert_eq!(&buf[..n], b"peek test data");
+
+        server_thread.join().expect("Server thread panicked");
+    }
+}

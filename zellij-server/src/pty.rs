@@ -16,7 +16,6 @@ use async_std::{
 };
 #[cfg(unix)]
 use nix::unistd::Pid;
-use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
 #[cfg(windows)]
 use sysinfo::Pid;
@@ -670,13 +669,13 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 {
                     Ok(..) => {},
                     Err(err) => match err.downcast_ref::<ZellijError>() {
-                        Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
+                        Some(ZellijError::CommandNotFound { terminal_id: _terminal_id, .. }) => {
                             if run_command.hold_on_close {
                                 #[cfg(unix)]
                                 pty.bus
                                     .senders
                                     .send_to_screen(ScreenInstruction::PtyBytes(
-                                        *terminal_id,
+                                        *_terminal_id,
                                         format!(
                                             "Command not found: {}",
                                             run_command.command.display()
@@ -689,7 +688,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                                 pty.bus
                                     .senders
                                     .send_to_screen(ScreenInstruction::HoldPane(
-                                        PaneId::Terminal(*terminal_id),
+                                        PaneId::Terminal(*_terminal_id),
                                         Some(2), // exit status
                                         run_command,
                                     ))
@@ -791,33 +790,33 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 }
             },
             PtyInstruction::FillPluginCwd(
-                should_float,
-                should_be_open_in_place,
-                pane_title,
-                run,
-                tab_index,
-                pane_id_to_replace,
-                client_id,
-                size,
-                skip_cache,
-                cwd,
-                should_focus_plugin,
-                floating_pane_coordinates,
+                _should_float,
+                _should_be_open_in_place,
+                _pane_title,
+                _run,
+                _tab_index,
+                _pane_id_to_replace,
+                _client_id,
+                _size,
+                _skip_cache,
+                _cwd,
+                _should_focus_plugin,
+                _floating_pane_coordinates,
             ) => {
                 #[cfg(unix)]
                 pty.fill_plugin_cwd(
-                    should_float,
-                    should_be_open_in_place,
-                    pane_title,
-                    run,
-                    tab_index,
-                    pane_id_to_replace,
-                    client_id,
-                    size,
-                    skip_cache,
-                    cwd,
-                    should_focus_plugin,
-                    floating_pane_coordinates,
+                    _should_float,
+                    _should_be_open_in_place,
+                    _pane_title,
+                    _run,
+                    _tab_index,
+                    _pane_id_to_replace,
+                    _client_id,
+                    _size,
+                    _skip_cache,
+                    _cwd,
+                    _should_focus_plugin,
+                    _floating_pane_coordinates,
                 )?;
             },
             PtyInstruction::Reconfigure {
@@ -1464,7 +1463,7 @@ impl Pty {
                 continue;
             }
             match pid_primary {
-                Ok(pid_primary) => {
+                Ok(_pid_primary) => {
                     let terminal_bytes = task::spawn({
                         let senders = self.bus.senders.clone();
                         let os_input = self
@@ -1775,7 +1774,7 @@ impl Pty {
                         .reserve_terminal_id()
                     {
                         Ok(terminal_id) => {
-                            let tid = terminal_id.clone();
+                            let _tid = terminal_id.clone();
                             Ok(Some((
                                 terminal_id,
                                 starts_held,
@@ -1817,8 +1816,8 @@ impl Pty {
                 }
             },
             Some(Run::Cwd(cwd)) => {
-                let starts_held = false; // we do not hold Cwd panes
-                let shell = self.get_default_terminal(Some(cwd), Some(default_shell.clone()));
+                let _starts_held = false; // we do not hold Cwd panes
+                let _shell = self.get_default_terminal(Some(cwd), Some(default_shell.clone()));
                 #[cfg(unix)]
                 match self
                     .bus
@@ -1826,16 +1825,16 @@ impl Pty {
                     .as_mut()
                     .context("no OS I/O interface found")
                     .with_context(err_context)?
-                    .spawn_terminal(shell, quit_cb, self.default_editor.clone())
+                    .spawn_terminal(_shell, quit_cb, self.default_editor.clone())
                     .with_context(err_context)
                 {
                     Ok((terminal_id, pid_primary, child_fd)) => {
                         self.id_to_child_pid.insert(terminal_id, child_fd);
-                        Ok(Some((terminal_id, starts_held, None, Ok(pid_primary))))
+                        Ok(Some((terminal_id, _starts_held, None, Ok(pid_primary))))
                     },
                     Err(err) => match err.downcast_ref::<ZellijError>() {
                         Some(ZellijError::CommandNotFound { terminal_id, .. }) => {
-                            Ok(Some((*terminal_id, starts_held, None, Err(err))))
+                            Ok(Some((*terminal_id, _starts_held, None, Err(err))))
                         },
                         _ => Err(err),
                     },
@@ -1843,8 +1842,8 @@ impl Pty {
                 #[cfg(windows)]
                 todo!()
             },
-            Some(Run::EditFile(path_to_file, line_number, cwd)) => {
-                let starts_held = false; // we do not hold edit panes (for now?)
+            Some(Run::EditFile(_path_to_file, _line_number, _cwd)) => {
+                let _starts_held = false; // we do not hold edit panes (for now?)
                 #[cfg(unix)]
                 match self
                     .bus
@@ -2107,8 +2106,8 @@ impl Pty {
     #[cfg(windows)]
     pub fn rerun_command_in_pane(
         &mut self,
-        pane_id: PaneId,
-        run_command: RunCommand,
+        _pane_id: PaneId,
+        _run_command: RunCommand,
     ) -> Result<()> {
         todo!()
     }
@@ -2236,7 +2235,7 @@ impl Pty {
 
     #[cfg(windows)]
     fn child_to_pid(child: &WinPtyReference) -> Pid {
-        /// TODO somehow support `Pid::from(WinPtyReference)`. This eliminates this special casing
+        // TODO somehow support `Pid::from(WinPtyReference)`. This eliminates this special casing
         Pid::from(child.pty.read().unwrap().get_pid() as usize)
     }
 
@@ -2300,8 +2299,15 @@ pub fn get_default_shell() -> PathBuf {
     }));
 
     #[cfg(windows)]
-    PathBuf::from(std::env::var("SHELL").unwrap_or_else(|_| {
-        log::warn!("Cannot read SHELL env, falling back to use cmd");
-        "c:\\windows\\system32\\cmd.exe".to_string()
-    }))
+    {
+        // On Windows, prefer COMSPEC (the native Windows shell variable) over SHELL.
+        // SHELL may contain MSYS2/Cygwin paths (e.g., /usr/bin/bash) that are not
+        // valid Windows paths and will cause CreateProcessW to fail.
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| {
+            log::warn!("Cannot read COMSPEC env, falling back to use cmd.exe");
+            "c:\\windows\\system32\\cmd.exe".to_string()
+        });
+        log::info!("Using default shell: {}", shell);
+        PathBuf::from(shell)
+    }
 }

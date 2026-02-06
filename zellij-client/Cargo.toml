@@ -63,12 +63,12 @@ serial_test = "3.0"
 
 [features]
 unstable = []
-# web_server_capability = [
-#     "dep:futures",
-#     "dep:axum",
-#     "dep:axum-extra",
-#     "dep:time",
-#     "dep:axum-server",
-#     "dep:tower-http",
-#     "zellij-utils/web_server_capability",
-# ]
+web_server_capability = [
+    "dep:futures",
+    "dep:axum",
+    "dep:axum-extra",
+    "dep:time",
+    "dep:axum-server",
+    "dep:tower-http",
+    "zellij-utils/web_server_capability",
+]

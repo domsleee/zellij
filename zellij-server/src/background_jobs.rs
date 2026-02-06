@@ -282,7 +282,7 @@ pub(crate) fn background_jobs_main(
                                 )]));
                             },
                             Err(e) => {
-                                log::error!("Failed to run command: {}", e);
+                                log::error!("Failed to run command {:?} (args: {:?}): {}", command, args, e);
                                 let stdout = vec![];
                                 let stderr = format!("{}", e).as_bytes().to_vec();
                                 let exit_code = Some(2);

@@ -1,17 +1,12 @@
 use anyhow::{Context, Result};
-use interprocess;
-use signal_hook;
 use zellij_utils::ipc::IpcSocketStream;
 use zellij_utils::pane_size::Size;
 
-use interprocess::local_socket::LocalSocketStream;
-
+#[cfg(unix)]
 use mio::{Events, Interest, Poll, Token};
 
 #[cfg(not(windows))]
 use mio::unix::SourceFd;
-#[cfg(windows)]
-use mio::windows::NamedPipe;
 #[cfg(not(windows))]
 use nix::{pty::Winsize, sys::termios};
 #[cfg(unix)]
@@ -21,17 +16,18 @@ use std::io::IsTerminal;
 #[cfg(not(windows))]
 use std::os::unix::io::RawFd;
 #[cfg(windows)]
-use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, RawHandle};
-use std::path::{Path, PathBuf};
+use std::os::windows::io::{AsHandle, AsRawHandle, RawHandle};
+use std::path::Path;
 use std::sync::{Arc, Mutex, TryLockError};
-use std::{io, process, thread, time};
+use std::{io, thread, time};
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::INVALID_HANDLE_VALUE,
     System::Console::{
         GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, ReadConsoleInputA,
         SetConsoleMode, CONSOLE_SCREEN_BUFFER_INFO, COORD, FOCUS_EVENT, FOCUS_EVENT_RECORD,
-        INPUT_RECORD, INPUT_RECORD_0, SMALL_RECT,
+        INPUT_RECORD, INPUT_RECORD_0, SMALL_RECT, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
     },
 };
 #[cfg(windows)]
@@ -40,13 +36,35 @@ use zellij_utils::{
     errors::ErrorContext,
     ipc::{ClientToServerMsg, IpcReceiverWithContext, IpcSenderWithContext, ServerToClientMsg},
     shared::default_palette,
-    windows_utils::named_pipe,
 };
 #[cfg(not(windows))]
 use zellij_utils::{libc, nix};
 
 #[cfg(not(windows))]
 const SIGWINCH_CB_THROTTLE_DURATION: time::Duration = time::Duration::from_millis(50);
+
+/// Global flag set by the Windows console ctrl handler when Ctrl+C, Ctrl+Break, or
+/// console close events are received. The signal listener thread polls this flag.
+#[cfg(windows)]
+static CTRL_C_PRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Windows console ctrl handler callback. Called by the OS when console control events occur.
+/// Sets the global CTRL_C_PRESSED flag and returns TRUE to prevent the default handler
+/// (which would terminate the process immediately).
+#[cfg(windows)]
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
+    };
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT => {
+            CTRL_C_PRESSED.store(true, std::sync::atomic::Ordering::SeqCst);
+            1 // TRUE - we handled it
+        },
+        _ => 0, // FALSE - let the next handler handle it
+    }
+}
 
 const ENABLE_MOUSE_SUPPORT: &str =
     "\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1003h\u{1b}[?1015h\u{1b}[?1006h";
@@ -121,10 +139,9 @@ pub(crate) fn get_terminal_size(handle_type: HandleType) -> Size {
 pub(crate) fn get_terminal_size(handle_type: HandleType) -> Size {
     // TODO: handle other handle types, only stdout is supported for now
     let handle_type = match handle_type {
-        HandleType::Stdin => windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
-        HandleType::Stdout => windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
-        HandleType::Stderr => windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
-        _ => windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+        HandleType::Stdin => STD_INPUT_HANDLE,
+        HandleType::Stdout => STD_OUTPUT_HANDLE,
+        HandleType::Stderr => STD_ERROR_HANDLE,
     };
 
     let default_size = Size { rows: 24, cols: 80 };
@@ -263,6 +280,7 @@ impl ClientOsApi for ClientOsInputOutput {
                     *slot = Some(consolemode.clone());
                 }
             },
+            _ => {},
         }
 
         consolemode = (consolemode & !disable_mode) | enable_mode;
@@ -476,11 +494,11 @@ impl ClientOsApi for ClientOsInputOutput {
                 thread::sleep(std::time::Duration::from_micros(50));
                 None
             },
-            Err(TryLockError::Poisoned(err)) => panic!("receiver has been poisoned"),
+            Err(TryLockError::Poisoned(_err)) => panic!("receiver has been poisoned"),
         };
         result
     }
-    fn handle_signals(&self, sigwinch_cb: Box<dyn Fn()>, quit_cb: Box<dyn Fn()>) {
+    fn handle_signals(&self, _sigwinch_cb: Box<dyn Fn()>, _quit_cb: Box<dyn Fn()>) {
         #[cfg(unix)]
         {
             let mut sigwinch_cb_timestamp = time::Instant::now();
@@ -493,13 +511,35 @@ impl ClientOsApi for ClientOsInputOutput {
                             thread::sleep(SIGWINCH_CB_THROTTLE_DURATION);
                         }
                         sigwinch_cb_timestamp = time::Instant::now();
-                        sigwinch_cb();
+                        _sigwinch_cb();
                     },
                     SIGTERM | SIGINT | SIGQUIT | SIGHUP => {
-                        quit_cb();
+                        _quit_cb();
                         break;
                     },
                     _ => unreachable!(),
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Register our console ctrl handler. This intercepts Ctrl+C, Ctrl+Break,
+            // and console close events, setting the CTRL_C_PRESSED flag.
+            // Note: SIGWINCH equivalent (terminal resize) is handled directly in
+            // read_from_stdin via WINDOW_BUFFER_SIZE_EVENT, so sigwinch_cb is unused here.
+            unsafe {
+                windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                    Some(console_ctrl_handler),
+                    1, // TRUE = add handler
+                );
+            }
+
+            // Poll the flag. This thread blocks until a ctrl event is received.
+            loop {
+                thread::sleep(time::Duration::from_millis(50));
+                if CTRL_C_PRESSED.load(std::sync::atomic::Ordering::SeqCst) {
+                    _quit_cb();
+                    break;
                 }
             }
         }
@@ -680,7 +720,7 @@ impl StdinPoller {
             match result {
                 0 => return true,    // wait object is ready to fetch
                 102 => return false, // timeout occured
-                x => return false, // something else happened see https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobjectex#return-value
+                _x => return false, // something else happened see https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobjectex#return-value
             }
         }
     }

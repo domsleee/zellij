@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[cfg(windows)]
-use winapi::shared::winerror::{ERROR_BROKEN_PIPE, ERROR_MORE_DATA};
+use winapi::shared::winerror::ERROR_BROKEN_PIPE;
 
 #[cfg(unix)]
 use crate::shared::set_permissions;
@@ -26,7 +26,7 @@ use std::{
     fmt::{Display, Error, Formatter},
     io::{self, Read, Write},
     marker::PhantomData,
-    path::{Path, PathBuf},
+    path::Path,
     thread::sleep,
     time::Duration,
 };
@@ -136,9 +136,6 @@ impl Display for ClientToServerMsg {
             ClientToServerMsg::ClientExited => write!(f, "ClientToServerMsg::ClientExited"),
             ClientToServerMsg::KillSession => write!(f, "ClientToServerMsg::KillSession"),
             ClientToServerMsg::ConnStatus => write!(f, "ClientToServerMsg::ConnStatus"),
-            ClientToServerMsg::WebServerStarted(..) => {
-                write!(f, "ClientToServerMsg::WebServerStarted")
-            },
             ClientToServerMsg::WebServerStarted(..) => {
                 write!(f, "ClientToServerMsg::WebServerStarted")
             },
@@ -489,7 +486,14 @@ where
                         }
                     },
                     Err(e) => {
+                        if e.kind() == std::io::ErrorKind::BrokenPipe
+                            || e.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32)
+                        {
+                            log::debug!("Pipe closed (broken pipe) in IpcReceiver.recv()");
+                            return None;
+                        }
                         log::error!("Error in IpcReceiver.recv(): {:?}", e);
+                        return None;
                     },
                 }
             }
@@ -580,4 +584,288 @@ pub fn bind_server(name: &Path) -> Result<Pipe> {
     let _ = std::fs::File::create(name);
 
     Ok(pipe)
+}
+
+#[cfg(all(test, windows))]
+mod windows_ipc_tests {
+    use super::*;
+    use crate::windows_utils::named_pipe::Pipe;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_pipe_path() -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        PathBuf::from(format!(
+            "ipc_test_{}_{}",
+            pid, id
+        ))
+    }
+
+    #[test]
+    fn ipc_sender_receiver_round_trip_conn_status() {
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let server_stream = pipe_clone.accept().expect("Server accept failed");
+            let mut receiver: IpcReceiverWithContext<ClientToServerMsg> =
+                IpcReceiverWithContext::new(server_stream);
+            let mut sender = receiver.get_sender::<ServerToClientMsg>();
+
+            // Receive ConnStatus from client
+            let (msg, _ctx) = receiver.recv().expect("Server recv failed");
+            assert!(
+                matches!(msg, ClientToServerMsg::ConnStatus),
+                "Expected ConnStatus, got: {:?}",
+                msg
+            );
+
+            // Send Connected back
+            sender.send(ServerToClientMsg::Connected).expect("Server send failed");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let client_stream = pipe.connect().expect("Client connect failed");
+        let mut sender: IpcSenderWithContext<ClientToServerMsg> =
+            IpcSenderWithContext::new(client_stream);
+        let mut receiver = sender.get_receiver::<ServerToClientMsg>();
+
+        // Send ConnStatus
+        sender.send(ClientToServerMsg::ConnStatus).expect("Client send failed");
+
+        // Receive Connected
+        let (msg, _ctx) = receiver.recv().expect("Client recv failed");
+        assert!(
+            matches!(msg, ServerToClientMsg::Connected),
+            "Expected Connected, got: {:?}",
+            msg
+        );
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn ipc_sender_receiver_round_trip_kill_session() {
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let server_stream = pipe_clone.accept().expect("Server accept failed");
+            let mut receiver: IpcReceiverWithContext<ClientToServerMsg> =
+                IpcReceiverWithContext::new(server_stream);
+
+            let (msg, _ctx) = receiver.recv().expect("Server recv failed");
+            assert!(
+                matches!(msg, ClientToServerMsg::KillSession),
+                "Expected KillSession, got: {:?}",
+                msg
+            );
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let client_stream = pipe.connect().expect("Client connect failed");
+        let mut sender: IpcSenderWithContext<ClientToServerMsg> =
+            IpcSenderWithContext::new(client_stream);
+
+        sender.send(ClientToServerMsg::KillSession).expect("Client send failed");
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn ipc_sender_receiver_round_trip_render() {
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let test_render_data = "Hello, Zellij!\x1b[32mGreen text\x1b[0m".to_string();
+        let expected_data = test_render_data.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let server_stream = pipe_clone.accept().expect("Server accept failed");
+            let receiver: IpcReceiverWithContext<ClientToServerMsg> =
+                IpcReceiverWithContext::new(server_stream);
+            let mut sender = receiver.get_sender::<ServerToClientMsg>();
+
+            sender
+                .send(ServerToClientMsg::Render(test_render_data))
+                .expect("Server send failed");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let client_stream = pipe.connect().expect("Client connect failed");
+        let mut receiver: IpcReceiverWithContext<ServerToClientMsg> =
+            IpcReceiverWithContext::new(client_stream);
+
+        // Use the Windows recv implementation which handles multi-part messages
+        let (msg, _ctx) = receiver.recv().expect("Client recv failed");
+        match msg {
+            ServerToClientMsg::Render(data) => {
+                assert_eq!(data, expected_data);
+            },
+            other => panic!("Expected Render, got: {:?}", other),
+        }
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn ipc_large_render_message() {
+        // Test sending a large Render message (simulating a full screen redraw)
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        // Create a large render payload (~16KB, typical for a full terminal screen)
+        let large_payload = "A".repeat(16 * 1024);
+        let expected = large_payload.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let server_stream = pipe_clone.accept().expect("Server accept failed");
+            let receiver: IpcReceiverWithContext<ClientToServerMsg> =
+                IpcReceiverWithContext::new(server_stream);
+            let mut sender = receiver.get_sender::<ServerToClientMsg>();
+
+            sender
+                .send(ServerToClientMsg::Render(large_payload))
+                .expect("Server send failed");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let client_stream = pipe.connect().expect("Client connect failed");
+        let mut receiver: IpcReceiverWithContext<ServerToClientMsg> =
+            IpcReceiverWithContext::new(client_stream);
+
+        let (msg, _ctx) = receiver.recv().expect("Client recv failed");
+        match msg {
+            ServerToClientMsg::Render(data) => {
+                assert_eq!(data.len(), expected.len(), "Render data length mismatch");
+                assert_eq!(data, expected, "Render data content mismatch");
+            },
+            other => panic!("Expected Render, got: {:?}", other),
+        }
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn ipc_sequential_conn_status_requests() {
+        // Test that a server can handle multiple sequential ConnStatus requests
+        // (simulates session discovery polling)
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            // Handle 3 sequential client connections
+            for i in 0..3 {
+                let server_stream = pipe_clone.accept().expect("Server accept failed");
+                let mut receiver: IpcReceiverWithContext<ClientToServerMsg> =
+                    IpcReceiverWithContext::new(server_stream);
+                let mut sender = receiver.get_sender::<ServerToClientMsg>();
+
+                let (msg, _ctx) = receiver.recv().expect("Server recv failed");
+                assert!(
+                    matches!(msg, ClientToServerMsg::ConnStatus),
+                    "Expected ConnStatus on iteration {}, got: {:?}",
+                    i,
+                    msg
+                );
+                sender
+                    .send(ServerToClientMsg::Connected)
+                    .expect("Server send failed");
+            }
+        });
+
+        // Give server time to start
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Connect 3 times sequentially
+        for i in 0..3 {
+            let client_stream = pipe
+                .connect()
+                .unwrap_or_else(|e| panic!("Client connect {} failed: {}", i, e));
+            let mut sender: IpcSenderWithContext<ClientToServerMsg> =
+                IpcSenderWithContext::new(client_stream);
+            let mut receiver = sender.get_receiver::<ServerToClientMsg>();
+
+            sender
+                .send(ClientToServerMsg::ConnStatus)
+                .unwrap_or_else(|e| panic!("Client send {} failed: {}", i, e));
+
+            let (msg, _ctx) = receiver
+                .recv()
+                .unwrap_or_else(|| panic!("Client recv {} returned None", i));
+            assert!(
+                matches!(msg, ServerToClientMsg::Connected),
+                "Expected Connected on iteration {}, got: {:?}",
+                i,
+                msg
+            );
+        }
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn ipc_sender_receiver_exit_reason() {
+        // Test sending Exit messages with different reasons
+        let path = unique_pipe_path();
+        let pipe = Pipe::new(&path);
+        let pipe_clone = pipe.clone();
+
+        let server_thread = std::thread::spawn(move || {
+            let server_stream = pipe_clone.accept().expect("Server accept failed");
+            let receiver: IpcReceiverWithContext<ClientToServerMsg> =
+                IpcReceiverWithContext::new(server_stream);
+            let mut sender = receiver.get_sender::<ServerToClientMsg>();
+
+            sender
+                .send(ServerToClientMsg::Exit(ExitReason::Normal))
+                .expect("Server send failed");
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let client_stream = pipe.connect().expect("Client connect failed");
+        let mut receiver: IpcReceiverWithContext<ServerToClientMsg> =
+            IpcReceiverWithContext::new(client_stream);
+
+        let (msg, _ctx) = receiver.recv().expect("Client recv failed");
+        match msg {
+            ServerToClientMsg::Exit(ExitReason::Normal) => {},
+            other => panic!("Expected Exit(Normal), got: {:?}", other),
+        }
+
+        server_thread.join().expect("Server thread panicked");
+    }
+
+    #[test]
+    fn bind_server_creates_marker_file() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "zellij_bind_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let session_name = format!("test_session_{}", std::process::id());
+        let path = temp_dir.join(&session_name);
+
+        let _pipe = bind_server(&path).expect("bind_server failed");
+
+        // Verify marker file was created
+        assert!(path.exists(), "Marker file should exist after bind_server");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
 }

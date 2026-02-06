@@ -27,11 +27,15 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 
+#[cfg(unix)]
 use daemonize::{self, Outcome};
+#[cfg(unix)]
 use nix::sys::stat::{umask, Mode};
-
+#[cfg(unix)]
 use interprocess::unnamed_pipe::pipe;
+#[cfg(unix)]
 use std::io::{prelude::*, BufRead, BufReader};
+
 use tokio::runtime::Runtime;
 use zellij_utils::input::{config::Config, options::Options};
 
@@ -97,6 +101,8 @@ pub fn start_web_client(
         eprintln!("{}", e);
         std::process::exit(2);
     };
+
+    #[cfg(unix)]
     let (runtime, listener, tls_config) = if run_daemonized {
         daemonize_web_server(
             web_server_ip,
@@ -105,48 +111,25 @@ pub fn start_web_client(
             web_server_key,
         )
     } else {
-        let runtime = Runtime::new().unwrap();
-        let listener = runtime.block_on(async move {
-            std::net::TcpListener::bind(format!("{}:{}", web_server_ip, web_server_port))
-        });
-        let tls_config = match (web_server_cert, web_server_key) {
-            (Some(web_server_cert), Some(web_server_key)) => {
-                let tls_config = runtime.block_on(async move {
-                    RustlsConfig::from_pem_file(
-                        PathBuf::from(web_server_cert),
-                        PathBuf::from(web_server_key),
-                    )
-                    .await
-                });
-                let tls_config = match tls_config {
-                    Ok(tls_config) => tls_config,
-                    Err(e) => {
-                        eprintln!("{}", e);
-                        std::process::exit(2);
-                    },
-                };
-                Some(tls_config)
-            },
-            (None, None) => None,
-            _ => {
-                eprintln!("Must specify both web_server_cert and web_server_key");
-                std::process::exit(2);
-            },
-        };
+        create_web_server_runtime(
+            web_server_ip,
+            web_server_port,
+            web_server_cert,
+            web_server_key,
+        )
+    };
 
-        match listener {
-            Ok(listener) => {
-                println!(
-                    "Web Server started on {} port {}",
-                    web_server_ip, web_server_port
-                );
-                (runtime, listener, tls_config)
-            },
-            Err(e) => {
-                eprintln!("{}", e);
-                std::process::exit(2);
-            },
+    #[cfg(windows)]
+    let (runtime, listener, tls_config) = {
+        if run_daemonized {
+            eprintln!("Warning: Daemonized mode is not supported on Windows. Running in foreground.");
         }
+        create_web_server_runtime(
+            web_server_ip,
+            web_server_port,
+            web_server_cert,
+            web_server_key,
+        )
     };
 
     runtime.block_on(serve_web_client(
@@ -158,6 +141,56 @@ pub fn start_web_client(
         None,
         None,
     ));
+}
+
+fn create_web_server_runtime(
+    web_server_ip: IpAddr,
+    web_server_port: u16,
+    web_server_cert: Option<PathBuf>,
+    web_server_key: Option<PathBuf>,
+) -> (Runtime, std::net::TcpListener, Option<RustlsConfig>) {
+    let runtime = Runtime::new().unwrap();
+    let listener = runtime.block_on(async move {
+        std::net::TcpListener::bind(format!("{}:{}", web_server_ip, web_server_port))
+    });
+    let tls_config = match (web_server_cert, web_server_key) {
+        (Some(web_server_cert), Some(web_server_key)) => {
+            let tls_config = runtime.block_on(async move {
+                RustlsConfig::from_pem_file(
+                    PathBuf::from(web_server_cert),
+                    PathBuf::from(web_server_key),
+                )
+                .await
+            });
+            let tls_config = match tls_config {
+                Ok(tls_config) => tls_config,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(2);
+                },
+            };
+            Some(tls_config)
+        },
+        (None, None) => None,
+        _ => {
+            eprintln!("Must specify both web_server_cert and web_server_key");
+            std::process::exit(2);
+        },
+    };
+
+    match listener {
+        Ok(listener) => {
+            println!(
+                "Web Server started on {} port {}",
+                web_server_ip, web_server_port
+            );
+            (runtime, listener, tls_config)
+        },
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        },
+    }
 }
 
 pub async fn serve_web_client(
@@ -237,6 +270,7 @@ pub async fn serve_web_client(
     }
 }
 
+#[cfg(unix)]
 fn daemonize_web_server(
     web_server_ip: IpAddr,
     web_server_port: u16,

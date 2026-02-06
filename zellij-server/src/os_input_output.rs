@@ -3,11 +3,7 @@ use crate::{panes::PaneId, ClientId};
 use async_std::io::ReadExt;
 
 use async_std;
-use interprocess;
-use signal_hook;
-use signal_hook::consts::*;
 use std::ffi::OsString;
-use std::io::Error;
 
 use sysinfo::{ProcessExt, ProcessRefreshKind, SystemExt};
 use tempfile::tempfile;
@@ -278,11 +274,11 @@ fn handle_terminal(
 #[cfg(windows)]
 fn handle_terminal(
     cmd: RunCommand,
-    failover_cmd: Option<RunCommand>,
+    _failover_cmd: Option<RunCommand>,
     quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
     terminal_id: u32,
 ) -> Result<Arc<RwLock<PTY>>> {
-    let err_context = || "failed to spawn terminal";
+    let _err_context = || "failed to spawn terminal";
 
     let pty_args = PTYArgs {
         cols: 80,
@@ -294,11 +290,32 @@ fn handle_terminal(
 
     let mut pty = PTY::new(&pty_args).map_err(|err| anyhow!("{:?}", err))?;
     let command: OsString = cmd.command.clone().into();
+    log::info!(
+        "Spawning terminal {}: command={:?}, args={:?}, cwd={:?}",
+        terminal_id,
+        command,
+        cmd.args,
+        cmd.cwd
+    );
+    // Build Windows environment block with ZELLIJ_PANE_ID added.
+    // Format: KEY1=VALUE1\0KEY2=VALUE2\0\0 (null-separated, double-null terminated)
+    let env_block = {
+        let mut env_str = std::ffi::OsString::new();
+        for (key, value) in std::env::vars_os() {
+            env_str.push(&key);
+            env_str.push("=");
+            env_str.push(&value);
+            env_str.push("\0");
+        }
+        env_str.push(format!("ZELLIJ_PANE_ID={}", terminal_id));
+        env_str.push("\0");
+        env_str
+    };
     pty.spawn(
         command.clone(),
         Some(cmd.args.join(" ").into()),
         cmd.cwd.as_ref().map(Into::into),
-        None, // TODO: Initialize ZELLIJ_PANE_ID Environment
+        Some(env_block),
     )
     .map_err(move |err| {
         anyhow!(
@@ -854,8 +871,7 @@ impl ServerOsApi for ServerOsInputOutput {
     ) -> Result<(u32, TerminalReference)> {
         let err_context = || "failed to spawn terminal".to_string();
 
-        let mut terminal_id = None;
-        {
+        let terminal_id = {
             let current_ids: BTreeSet<u32> = self
                 .terminal_id_to_reference
                 .lock()
@@ -864,8 +880,8 @@ impl ServerOsApi for ServerOsInputOutput {
                 .keys()
                 .copied()
                 .collect();
-            terminal_id = current_ids.last().map(|l| l + 1).or(Some(0));
-        }
+            current_ids.last().map(|l| l + 1).or(Some(0))
+        };
 
         match terminal_id {
             Some(terminal_id) => {
@@ -1018,9 +1034,9 @@ impl ServerOsApi for ServerOsInputOutput {
     }
 
     #[cfg(windows)]
-    fn tcdrain(&self, terminal_id: u32) -> Result<()> {
+    fn tcdrain(&self, _terminal_id: u32) -> Result<()> {
         Ok(())
-        // let err_context = || format!("failed to tcdrain to TTY ID {}", terminal_id);
+        // let err_context = || format!("failed to tcdrain to TTY ID {}", _terminal_id);
 
         // match self
         //     .terminal_id_to_reference
@@ -1053,18 +1069,16 @@ impl ServerOsApi for ServerOsInputOutput {
     }
     #[cfg(windows)]
     fn kill(&self, pid: Pid) -> Result<()> {
-        let res = System::new_all()
-            .process(pid)
-            .ok_or(Error::other("Unable to get process"))?
-            .kill_with(Signal::Hangup);
+        if let Some(process) = System::new_all().process(pid) {
+            process.kill_with(Signal::Hangup);
+        }
         Ok(())
     }
     #[cfg(windows)]
     fn force_kill(&self, pid: Pid) -> Result<()> {
-        let res = System::new_all()
-            .process(pid)
-            .ok_or(Error::other("Unable to get process"))?
-            .kill_with(Signal::Kill);
+        if let Some(process) = System::new_all().process(pid) {
+            process.kill_with(Signal::Kill);
+        }
         Ok(())
     }
     #[cfg(unix)]
@@ -1251,13 +1265,13 @@ impl ServerOsApi for ServerOsInputOutput {
             })
             .with_context(|| format!("failed to rerun command in terminal id {}", terminal_id))
     }
-    fn clear_terminal_id(&self, terminal_id: u32) -> Result<()> {
+    fn clear_terminal_id(&self, _terminal_id: u32) -> Result<()> {
         #[cfg(unix)]
         self.terminal_id_to_reference
             .lock()
             .to_anyhow()
-            .with_context(|| format!("failed to clear terminal ID {}", terminal_id))?
-            .remove(&terminal_id);
+            .with_context(|| format!("failed to clear terminal ID {}", _terminal_id))?
+            .remove(&_terminal_id);
         Ok(())
     }
     fn cache_resizes(&mut self) {
@@ -1367,6 +1381,6 @@ fn run_command_hook(
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "./unit/os_input_output_tests.rs"]
 mod os_input_output_tests;

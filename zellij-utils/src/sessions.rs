@@ -4,13 +4,13 @@ use crate::{
         ZELLIJ_SESSION_INFO_CACHE_DIR, ZELLIJ_SOCK_DIR,
     },
     envs,
-    errors::FatalError,
     input::layout::Layout,
     ipc::{ClientToServerMsg, ServerToClientMsg},
     ipc::{IpcReceiverWithContext, IpcSenderWithContext, IpcSocketStream},
 };
 use anyhow;
 use humantime::format_duration;
+#[cfg(unix)]
 use interprocess::local_socket::LocalSocketStream;
 use std::collections::HashMap;
 use std::iter::empty;
@@ -164,7 +164,7 @@ fn assert_socket(name: &str) -> bool {
         Ok(stream) => {
             let mut receiver = IpcReceiverWithContext::new(stream);
             let mut sender = receiver.get_sender();
-            sender.send(ClientToServerMsg::ConnStatus);
+            let _ = sender.send(ClientToServerMsg::ConnStatus);
             let _ = sender.send(ClientToServerMsg::ConnStatus);
             match receiver.recv() {
                 Some((ServerToClientMsg::Connected, _)) => true,
@@ -648,3 +648,284 @@ const NOUNS: &[&'static str] = &[
     "yak",
     "zebra",
 ];
+
+#[cfg(all(test, windows))]
+mod windows_session_tests {
+    use super::*;
+    use crate::consts::ZELLIJ_SOCK_DIR;
+    use crate::ipc::{self, ClientToServerMsg, IpcReceiverWithContext, ServerToClientMsg};
+    use crate::windows_utils::named_pipe::Pipe;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_session_name() -> String {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        format!("test_session_{}_{}_{}", pid, id, std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos())
+    }
+
+    /// Helper: start a mock server that responds to ConnStatus with Connected.
+    /// Returns the pipe and a handle to stop the server.
+    fn start_mock_session_server(session_name: &str) -> (Pipe, Arc<std::sync::atomic::AtomicBool>) {
+        let path = ZELLIJ_SOCK_DIR.join(session_name);
+        let pipe = ipc::bind_server(&path).expect("bind_server failed");
+        let pipe_clone = pipe.clone();
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let running_clone = running.clone();
+
+        std::thread::spawn(move || {
+            while running_clone.load(Ordering::SeqCst) {
+                match pipe_clone.accept() {
+                    Ok(stream) => {
+                        let mut receiver: IpcReceiverWithContext<ClientToServerMsg> =
+                            IpcReceiverWithContext::new(stream);
+                        if let Some((msg, _ctx)) = receiver.recv() {
+                            match msg {
+                                ClientToServerMsg::ConnStatus => {
+                                    let mut sender =
+                                        receiver.get_sender::<ServerToClientMsg>();
+                                    let _ =
+                                        sender.send(ServerToClientMsg::Connected);
+                                },
+                                ClientToServerMsg::KillSession => {
+                                    // Stop the server
+                                    running_clone.store(false, Ordering::SeqCst);
+                                    break;
+                                },
+                                _ => {},
+                            }
+                        }
+                    },
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Give the server thread time to start listening
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        (pipe, running)
+    }
+
+    fn cleanup_session(session_name: &str) {
+        let path = ZELLIJ_SOCK_DIR.join(session_name);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_bind_creates_marker_file() {
+        let name = unique_session_name();
+        let path = ZELLIJ_SOCK_DIR.join(&name);
+        let _ = std::fs::create_dir_all(&*ZELLIJ_SOCK_DIR);
+
+        let _pipe = ipc::bind_server(&path).expect("bind_server failed");
+
+        // Marker file should exist
+        assert!(path.exists(), "Marker file should exist after bind_server");
+
+        // Cleanup
+        cleanup_session(&name);
+    }
+
+    #[test]
+    fn session_is_discoverable_via_wait_named_pipe() {
+        let name = unique_session_name();
+        let (_pipe, running) = start_mock_session_server(&name);
+
+        // The session should be discoverable via is_socket (WaitNamedPipeW)
+        let path = ZELLIJ_SOCK_DIR.join(&name);
+        let entry = std::fs::read_dir(&*ZELLIJ_SOCK_DIR)
+            .expect("read_dir failed")
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy() == name);
+        assert!(entry.is_some(), "Session marker file should be in ZELLIJ_SOCK_DIR");
+
+        let entry = entry.unwrap();
+        let result = is_socket(&entry);
+        assert!(
+            result.unwrap_or(false),
+            "is_socket (WaitNamedPipeW) should return true for active session"
+        );
+
+        // Cleanup
+        running.store(false, Ordering::SeqCst);
+        // Connect to unblock the accept() call
+        let _ = Pipe::new(&path).connect();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cleanup_session(&name);
+    }
+
+    #[test]
+    fn session_conn_status_handshake() {
+        let name = unique_session_name();
+        let (_pipe, running) = start_mock_session_server(&name);
+
+        // assert_socket should succeed (ConnStatus -> Connected)
+        assert!(
+            assert_socket(&name),
+            "assert_socket should return true for active session with ConnStatus handler"
+        );
+
+        // Cleanup
+        running.store(false, Ordering::SeqCst);
+        let path = ZELLIJ_SOCK_DIR.join(&name);
+        let _ = Pipe::new(&path).connect();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cleanup_session(&name);
+    }
+
+    #[test]
+    fn session_appears_in_get_sessions() {
+        let name = unique_session_name();
+        let (_pipe, running) = start_mock_session_server(&name);
+
+        // get_sessions should find this session
+        let sessions = get_sessions().expect("get_sessions failed");
+        let found = sessions.iter().any(|(s, _)| s == &name);
+        assert!(
+            found,
+            "get_sessions() should find the test session '{}'. Found sessions: {:?}",
+            name,
+            sessions.iter().map(|(s, _)| s).collect::<Vec<_>>()
+        );
+
+        // Cleanup
+        running.store(false, Ordering::SeqCst);
+        let path = ZELLIJ_SOCK_DIR.join(&name);
+        let _ = Pipe::new(&path).connect();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cleanup_session(&name);
+    }
+
+    #[test]
+    fn session_exists_check() {
+        let name = unique_session_name();
+        let (_pipe, running) = start_mock_session_server(&name);
+
+        // session_exists should return true
+        assert!(
+            session_exists(&name).unwrap_or(false),
+            "session_exists() should return true for active session"
+        );
+
+        // A non-existent session should return false
+        assert!(
+            !session_exists("nonexistent_session_that_does_not_exist_12345").unwrap_or(true),
+            "session_exists() should return false for non-existent session"
+        );
+
+        // Cleanup
+        running.store(false, Ordering::SeqCst);
+        let path = ZELLIJ_SOCK_DIR.join(&name);
+        let _ = Pipe::new(&path).connect();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cleanup_session(&name);
+    }
+
+    #[test]
+    fn session_kill_via_ipc() {
+        let name = unique_session_name();
+        let (_pipe, running) = start_mock_session_server(&name);
+
+        // Verify session exists first
+        assert!(
+            session_exists(&name).unwrap_or(false),
+            "Session should exist before kill"
+        );
+
+        // Send kill command via IPC (this is what `zellij kill-session` does)
+        let path = ZELLIJ_SOCK_DIR.join(&name);
+        let stream = IpcSocketStream::connect(&path).expect("Connect for kill failed");
+        let _ = crate::ipc::IpcSenderWithContext::new(stream)
+            .send(ClientToServerMsg::KillSession);
+
+        // Give the server time to process the kill and shut down
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // The server should have stopped
+        assert!(
+            !running.load(Ordering::SeqCst),
+            "Server should have stopped after KillSession"
+        );
+
+        // Cleanup marker file
+        cleanup_session(&name);
+    }
+
+    #[test]
+    fn stale_marker_file_not_detected_as_session() {
+        let name = unique_session_name();
+        let path = ZELLIJ_SOCK_DIR.join(&name);
+        let _ = std::fs::create_dir_all(&*ZELLIJ_SOCK_DIR);
+
+        // Create just a marker file with no pipe behind it
+        std::fs::File::create(&path).expect("Failed to create marker file");
+        assert!(path.exists(), "Marker file should exist");
+
+        // is_socket should return false (or error) since no pipe exists
+        let entry = std::fs::read_dir(&*ZELLIJ_SOCK_DIR)
+            .expect("read_dir failed")
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy() == name);
+        assert!(entry.is_some(), "Marker file should be in directory");
+
+        let entry = entry.unwrap();
+        let result = is_socket(&entry).unwrap_or(false);
+        assert!(
+            !result,
+            "is_socket should return false for stale marker file (no pipe behind it)"
+        );
+
+        // get_sessions should NOT include this stale session
+        let sessions = get_sessions().unwrap_or_default();
+        let found = sessions.iter().any(|(s, _)| s == &name);
+        assert!(
+            !found,
+            "get_sessions() should not include stale marker file as active session"
+        );
+
+        // Cleanup
+        cleanup_session(&name);
+    }
+
+    #[test]
+    fn multiple_sessions_discoverable() {
+        let name1 = unique_session_name();
+        let name2 = unique_session_name();
+
+        let (_pipe1, running1) = start_mock_session_server(&name1);
+        let (_pipe2, running2) = start_mock_session_server(&name2);
+
+        // Both sessions should appear in get_sessions
+        let sessions = get_sessions().expect("get_sessions failed");
+        let found1 = sessions.iter().any(|(s, _)| s == &name1);
+        let found2 = sessions.iter().any(|(s, _)| s == &name2);
+
+        assert!(
+            found1,
+            "First session '{}' should be discoverable",
+            name1
+        );
+        assert!(
+            found2,
+            "Second session '{}' should be discoverable",
+            name2
+        );
+
+        // Cleanup
+        running1.store(false, Ordering::SeqCst);
+        running2.store(false, Ordering::SeqCst);
+        let path1 = ZELLIJ_SOCK_DIR.join(&name1);
+        let path2 = ZELLIJ_SOCK_DIR.join(&name2);
+        let _ = Pipe::new(&path1).connect();
+        let _ = Pipe::new(&path2).connect();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cleanup_session(&name1);
+        cleanup_session(&name2);
+    }
+}

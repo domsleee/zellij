@@ -5654,5 +5654,5 @@ pub(crate) fn screen_thread_main(
 }
 
 #[path = "./unit/screen_tests.rs"]
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod screen_tests;

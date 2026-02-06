@@ -1203,7 +1203,7 @@ pub(crate) fn route_thread_main(
 
                 // retry on loop around
                 retry_queue.append(&mut repeat_retries);
-                let mut should_break = handle_instruction(instruction, Some(&mut retry_queue))?;
+                let should_break = handle_instruction(instruction, Some(&mut retry_queue))?;
                 if should_break {
                     #[cfg(windows)]
                     {

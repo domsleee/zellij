@@ -30,13 +30,10 @@ use termwiz::input::InputEvent;
 use zellij_utils::cli::CliArgs;
 
 #[cfg(windows)]
-use windows_sys::Win32::System::{
-    Console::{
-        DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
-        STD_OUTPUT_HANDLE,
-    },
-    Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS},
+use windows_sys::Win32::System::Console::{
+    ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE,
 };
 
 #[cfg(unix)]
@@ -482,10 +479,10 @@ pub fn start_client(
     std::panic::set_hook({
         use zellij_utils::errors::handle_panic;
         let send_client_instructions = send_client_instructions.clone();
-        let os_input = os_input.clone();
+        let _os_input = os_input.clone();
         Box::new(move |info| {
             #[cfg(unix)]
-            if let Ok(()) = os_input.unset_raw_mode(0) {
+            if let Ok(()) = _os_input.unset_raw_mode(0) {
                 handle_panic(info, &send_client_instructions);
             }
 

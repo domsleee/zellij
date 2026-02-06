@@ -355,16 +355,26 @@ impl WasmBridge {
                     },
                 }
                 let cache_dir = running_plugin.store.data().plugin_own_data_dir.clone();
-                if let Err(e) = std::fs::remove_dir_all(cache_dir) {
-                    log::error!("Failed to remove cache dir for plugin: {:?}", e);
+                if let Err(_e) = std::fs::remove_dir_all(&cache_dir) {
+                    // On Windows, files may still be locked by the WASM runtime.
+                    // Retry once after a short delay before giving up.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
+                        log::debug!("Failed to remove cache dir for plugin (will be cleaned up later): {:?}", e);
+                    }
                 }
             } else {
                 // this is duplicated because of locking/unlocking order between running_plugin and
                 // subscriptions
                 let running_plugin = running_plugin.lock().unwrap();
                 let cache_dir = running_plugin.store.data().plugin_own_data_dir.clone();
-                if let Err(e) = std::fs::remove_dir_all(cache_dir) {
-                    log::error!("Failed to remove cache dir for plugin: {:?}", e);
+                if let Err(_e) = std::fs::remove_dir_all(&cache_dir) {
+                    // On Windows, files may still be locked by the WASM runtime.
+                    // Retry once after a short delay before giving up.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
+                        log::debug!("Failed to remove cache dir for plugin (will be cleaned up later): {:?}", e);
+                    }
                 }
             }
         }
