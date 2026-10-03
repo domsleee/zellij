@@ -1,0 +1,16 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const handlers={},messages=[];
+const parent={postMessage:(message,origin)=>messages.push({message,origin})};
+const location={pathname:'/hosts/windows/main',origin:'http://127.0.0.1:8090',href:'http://127.0.0.1:8090/hosts/windows/main'};
+const window={__switchboardLinkHosts:{windows:{origin:'https://172.20.10.69:8082',local:false,artifacts:{'9000':'http://127.0.0.1:9090'}}},addEventListener:(type,fn)=>handlers[type]=fn};
+window.term={cols:80,element:{},_core:{_mouseService:{},linkifier:{_positionFromMouseEvent:()=>({x:3,y:1}),_currentLink:{link:{text:'http://127.0.0.1:8765/',range:{start:{x:1,y:1},end:{x:8,y:1}}}}}}};
+vm.runInNewContext(fs.readFileSync(__dirname+'/static/links.js','utf8'),{window,parent,location,URL,console,setInterval:()=>1,clearInterval:()=>{}});
+assert.equal(window.__switchboardResolveLink('http://127.0.0.1:8765/a?q=1'),'http://172.20.10.69:8765/a?q=1');
+assert.equal(window.__switchboardResolveLink('http://localhost:9000/a'),'http://127.0.0.1:9090/a');
+assert.throws(()=>window.__switchboardResolveLink('javascript:alert(1)'));
+const click={shiftKey:true,button:0,clientX:1,clientY:1,target:{closest:()=>true},preventDefault(){},stopImmediatePropagation(){}};
+handlers.mousedown({...click,shiftKey:false});handlers.mouseup({...click,shiftKey:false});assert.equal(messages.length,0);
+handlers.mousedown(click);handlers.mouseup({...click,clientX:20});assert.equal(messages.length,0);
+handlers.mousedown(click);handlers.mouseup(click);assert.equal(messages.length,1);
+assert.equal(messages[0].message.type,'zellij-open-link');assert.equal(messages[0].message.uri,'http://172.20.10.69:8765/');assert.equal(messages[0].origin,location.origin);
+console.log('Shift-click opens an in-page artifact; URL mapping and drag/plain-click guards passed.');
